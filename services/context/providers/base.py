@@ -80,13 +80,82 @@ def gather(
             chunks = p.fetch(refs)
             log.info("provider %s returned %d chunks", p.name, len(chunks))
             if on_progress:
-                on_progress(f":white_check_mark: `{p.name}` → {len(chunks)} chunk(s)")
+                links = _reference_links(p.name, chunks)
+                # Append a short `• links: …` tail for jira/confluence so
+                # reviewers can click through to whatever Redink actually
+                # pulled. Other providers don't get links (repo snapshot is
+                # the whole repo; github issues are already in the PR body).
+                suffix = f"  · {links}" if links else ""
+                on_progress(
+                    f":white_check_mark: `{p.name}` → {len(chunks)} chunk(s){suffix}"
+                )
             out.extend(chunks)
         except Exception:  # broad by design — providers must never kill the review
             log.exception("provider %s failed", p.name)
             if on_progress:
                 on_progress(f":warning: `{p.name}` failed — skipping")
     return out
+
+
+def _reference_links(provider_name: str, chunks: list[ContextChunk]) -> str:
+    """Build a Slack-formatted `<url|label>` list from the chunks, for the
+    providers where a clickable link actually helps the reviewer — i.e. Jira
+    tickets and Confluence pages. Returns an empty string otherwise.
+
+    We deliberately dedupe Jira keys so that (KEY, KEY:comments, KEY:subtask:X)
+    collapses to one entry per distinct ticket. Confluence chunks each have
+    their own page id, so every chunk gets its own link.
+    """
+    from services.config import settings
+
+    if not chunks:
+        return ""
+    s = settings()
+
+    if provider_name == "jira":
+        base = (s.jira_base_url or "").rstrip("/")
+        if not base:
+            return ""
+        keys: list[str] = []
+        seen: set[str] = set()
+        for c in chunks:
+            # source shapes: "jira:KEY", "jira:KEY:comments",
+            # "jira:KEY:subtask:CHILD", "jira:KEY:parent:EPIC".
+            parts = (c.source or "").split(":")
+            if len(parts) >= 2 and parts[0] == "jira":
+                key = parts[3] if len(parts) >= 4 and parts[2] in ("subtask", "parent") else parts[1]
+                if key and key not in seen:
+                    seen.add(key)
+                    keys.append(key)
+        if not keys:
+            return ""
+        return "links: " + ", ".join(f"<{base}/browse/{k}|{k}>" for k in keys)
+
+    if provider_name == "confluence":
+        base = (s.confluence_base_url or "").rstrip("/")
+        if not base:
+            return ""
+        # Normalise so we don't double up on `/wiki` whether the user configured
+        # `https://tenant.atlassian.net` or `https://tenant.atlassian.net/wiki`.
+        if base.endswith("/wiki"):
+            wiki = base
+        else:
+            wiki = f"{base}/wiki"
+        links: list[str] = []
+        seen_ids: set[str] = set()
+        for c in chunks:
+            parts = (c.source or "").split(":", 1)
+            if len(parts) == 2 and parts[0] == "confluence":
+                pid = parts[1]
+                if pid and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    label = (c.title or f"page {pid}").replace("|", "-").replace(">", "")[:60]
+                    links.append(f"<{wiki}/pages/viewpage.action?pageId={pid}|{label}>")
+        if not links:
+            return ""
+        return "links: " + ", ".join(links)
+
+    return ""
 
 
 def _start_label(p: ContextProvider, refs: PRRefs) -> str:
