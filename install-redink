@@ -1,0 +1,491 @@
+#!/usr/bin/env bash
+# install-redink — zero-to-reviewable in one command.
+#
+# Idempotent: safe to re-run. Each step checks current state and only does the
+# minimum work needed.
+#
+# Two runtime profiles, chosen interactively:
+#
+#   1. LOCAL (default): no Docker. Ollama installed natively (brew). Redink api
+#      runs in the venv against a SQLite file. Zero external services.
+#
+#   2. DOCKER: everything containerised — postgres + api + ollama via compose.
+#      Production-shaped; heavier; needs Docker Desktop running.
+#
+# Two review engines, chosen interactively (or auto-picked):
+#
+#   A. claude-code  — frontier quality via the `claude` CLI. Default if we
+#                     detect `claude` on PATH. Skips the Ollama install entirely.
+#   B. ollama       — local, free, gemma4:e2b. Default if `claude` isn't present.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_ROOT"
+
+# --- tiny output helpers --------------------------------------------------------
+
+c_red()    { printf '\033[0;31m%s\033[0m' "$*"; }
+c_green()  { printf '\033[0;32m%s\033[0m' "$*"; }
+c_yellow() { printf '\033[0;33m%s\033[0m' "$*"; }
+c_cyan()   { printf '\033[0;36m%s\033[0m' "$*"; }
+c_dim()    { printf '\033[2m%s\033[0m' "$*"; }
+c_bold()   { printf '\033[1m%s\033[0m' "$*"; }
+
+# Redink wordmark — bold white on red background. The spaces inside the escape
+# are intentional: they give the "badge" left/right padding so it reads as a
+# pill rather than bare text.
+wordmark() { printf '\033[1;97;41m %s \033[0m' "REDINK"; }
+
+step()  { printf '\n%s %s\n' "$(c_cyan '==>')" "$(c_bold "$*")"; }
+ok()    { printf '    %s %s\n' "$(c_green '✓')" "$*"; }
+info()  { printf '    %s %s\n' "$(c_cyan 'i')" "$*"; }
+warn()  { printf '    %s %s\n' "$(c_yellow '!')" "$*"; }
+fail()  { printf '    %s %s\n' "$(c_red '✗')" "$*" >&2; exit 1; }
+
+confirm() {
+    local prompt="$1"
+    local default="${2:-Y}"
+    local suffix="[Y/n]"
+    [[ "$default" =~ ^[Nn]$ ]] && suffix="[y/N]"
+    read -r -p "    $prompt $suffix " ans
+    ans="${ans:-$default}"
+    [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+ensure_brew() {
+    if ! command -v brew >/dev/null 2>&1; then
+        fail "Homebrew required for auto-install. Install it from https://brew.sh and re-run."
+    fi
+}
+
+# Rewrite / insert a KEY=VALUE line in .env. Safe for values with regex chars.
+set_env_var() {
+    local key="$1"
+    local value="$2"
+    python - "$key" "$value" <<'PY'
+import pathlib, re, sys
+key, value = sys.argv[1], sys.argv[2]
+p = pathlib.Path('.env')
+text = p.read_text() if p.exists() else ''
+pat = re.compile(rf'^{re.escape(key)}=.*$', re.MULTILINE)
+if pat.search(text):
+    text = pat.sub(f'{key}={value}', text)
+else:
+    if text and not text.endswith('\n'):
+        text += '\n'
+    text += f'{key}={value}\n'
+p.write_text(text)
+PY
+}
+
+# --- 0. Banner -----------------------------------------------------------------
+
+printf '\n  %s  %s\n' "$(wordmark)" "$(c_dim 'AI PR reviewer · Slack-mediated clarification · pluggable engines')"
+
+# --- 1. Python ------------------------------------------------------------------
+
+step "Checking Python (need 3.10+)"
+
+PY=""
+for cand in /opt/homebrew/bin/python3.12 /usr/local/bin/python3.12 python3.12 python3.11 python3.10 python3; do
+    if command -v "$cand" >/dev/null 2>&1; then
+        ver=$("$cand" -c 'import sys;print("%d.%d"%sys.version_info[:2])' 2>/dev/null || echo "0.0")
+        major=${ver%%.*}; minor=${ver#*.}
+        if [[ "$major" -ge 3 && "$minor" -ge 10 ]]; then
+            PY="$cand"
+            ok "Using $(c_cyan "$PY") ($ver)"
+            break
+        fi
+    fi
+done
+if [[ -z "$PY" ]]; then
+    if command -v brew >/dev/null 2>&1; then
+        if confirm "Python 3.10+ not found. Install python@3.12 via Homebrew now?"; then
+            brew install python@3.12
+            PY="$(brew --prefix)/bin/python3.12"
+            ok "Installed $PY"
+        else
+            fail "Install Python 3.10+ and re-run."
+        fi
+    else
+        fail "No Python 3.10+ and no Homebrew. Install Homebrew (https://brew.sh) or Python 3.12, then re-run."
+    fi
+fi
+
+# --- 2. venv --------------------------------------------------------------------
+
+step "Preparing virtualenv (.venv)"
+
+if [[ -d .venv && -x .venv/bin/python ]]; then
+    ok ".venv already exists"
+else
+    "$PY" -m venv .venv
+    ok "Created .venv with $PY"
+fi
+# shellcheck disable=SC1091
+source .venv/bin/activate
+
+# --- 3. pip install -------------------------------------------------------------
+
+step "Installing Redink (pip install -e .)"
+
+python -m pip install --quiet --upgrade pip
+python -m pip install --quiet -e .
+ok "Installed"
+
+# --- 4. Detect claude-code + pick review engine --------------------------------
+
+step "Detecting review engines"
+
+CLAUDE_DETECTED=0
+CLAUDE_VERSION=""
+if command -v claude >/dev/null 2>&1; then
+    CLAUDE_DETECTED=1
+    CLAUDE_VERSION=$(claude --version 2>/dev/null | head -n1 || echo "installed")
+    ok "Claude Code CLI found ($(c_cyan "$CLAUDE_VERSION"))"
+else
+    info "Claude Code CLI not found on PATH"
+fi
+
+if command -v ollama >/dev/null 2>&1; then
+    ok "Ollama CLI found ($(ollama --version 2>/dev/null | head -n1))"
+else
+    info "Ollama CLI not installed"
+fi
+
+# Engine choice — default = claude-code if detected, else ollama.
+step "Choose review engine"
+
+if [[ "$CLAUDE_DETECTED" -eq 1 ]]; then
+    echo "    $(c_bold '1.') claude-code  — frontier quality (Sonnet/Opus via your Claude Code CLI). $(c_green '← default')"
+    echo "    $(c_bold '2.') ollama       — local, free, private (gemma4:e2b by default)."
+    echo "    $(c_bold '3.') both         — install Ollama too; pick per-review with -e/--engine."
+    read -r -p "    Choose [1/2/3, default 1]: " engine_choice
+    engine_choice="${engine_choice:-1}"
+else
+    echo "    $(c_bold '1.') ollama       — local, free, private (gemma4:e2b by default). $(c_green '← default')"
+    echo "    $(c_bold '2.') claude-code  — install the Claude Code CLI for frontier-quality reviews."
+    read -r -p "    Choose [1/2, default 1]: " engine_map_choice
+    engine_map_choice="${engine_map_choice:-1}"
+    # Remap so downstream only sees 1/2/3.
+    case "$engine_map_choice" in
+        1) engine_choice=2 ;;      # ollama-only
+        2) engine_choice=1 ;;      # wants claude-code; we'll offer to install below
+        *) engine_choice=2 ;;
+    esac
+fi
+
+WANT_CLAUDE=0
+WANT_OLLAMA=0
+DEFAULT_ENGINE=""
+case "$engine_choice" in
+    1) WANT_CLAUDE=1; DEFAULT_ENGINE="claude-code" ;;
+    2) WANT_OLLAMA=1; DEFAULT_ENGINE="ollama" ;;
+    3) WANT_CLAUDE=1; WANT_OLLAMA=1; DEFAULT_ENGINE="claude-code" ;;
+    *) warn "Unrecognised choice; defaulting to ollama."; WANT_OLLAMA=1; DEFAULT_ENGINE="ollama" ;;
+esac
+
+# If user wants claude-code but doesn't have it, offer to install via npm.
+if [[ "$WANT_CLAUDE" -eq 1 && "$CLAUDE_DETECTED" -eq 0 ]]; then
+    if command -v npm >/dev/null 2>&1; then
+        if confirm "Install the Claude Code CLI via 'npm i -g @anthropic-ai/claude-code' now?"; then
+            npm i -g @anthropic-ai/claude-code
+            if command -v claude >/dev/null 2>&1; then
+                ok "Installed $(claude --version 2>/dev/null | head -n1)"
+                CLAUDE_DETECTED=1
+                info "Run $(c_cyan 'claude') once in another terminal to authenticate (browser-based)."
+            else
+                warn "npm install finished but 'claude' still not on PATH. Check your npm global bin."
+            fi
+        else
+            warn "Skipped claude-code install. Run 'npm i -g @anthropic-ai/claude-code' yourself later."
+        fi
+    else
+        warn "npm not found. Install Node.js (brew install node), then: npm i -g @anthropic-ai/claude-code"
+    fi
+fi
+
+ok "Default engine: $(c_cyan "$DEFAULT_ENGINE")"
+
+# --- 5. Pick runtime profile ---------------------------------------------------
+
+step "Where should Redink run?"
+
+echo "    $(c_bold '1.') Local (recommended for POC)  — no Docker; SQLite DB; runs api in venv."
+echo "    $(c_bold '2.') Docker (production-shaped)   — postgres + api in compose."
+read -r -p "    Choose [1/2, default 1]: " mode_choice
+mode_choice="${mode_choice:-1}"
+
+PROFILE="local"
+case "$mode_choice" in
+    1|l|L|local)  PROFILE="local" ;;
+    2|d|D|docker) PROFILE="docker" ;;
+    *) warn "Unrecognised choice; defaulting to local."; PROFILE="local" ;;
+esac
+ok "Profile: $(c_cyan "$PROFILE")"
+
+# claude-code needs the `claude` binary accessible to whichever process runs the
+# review. In docker profile the api container doesn't have it — warn the user.
+if [[ "$WANT_CLAUDE" -eq 1 && "$PROFILE" == "docker" ]]; then
+    warn "Docker profile + claude-code: the api container can't see your host 'claude' binary."
+    warn "Use the 'local' profile, or add 'ollama' as a fallback engine."
+fi
+
+# --- 5. .env preparation --------------------------------------------------------
+
+step "Preparing .env"
+
+if [[ ! -f .env ]]; then
+    [[ -f .env.example ]] || fail "Neither .env nor .env.example exists — reinstall the repo."
+    cp .env.example .env
+    chmod 600 .env
+    ok "Created .env from .env.example"
+else
+    ok ".env exists"
+fi
+
+# --- 6. Profile-specific setup --------------------------------------------------
+
+if [[ "$PROFILE" == "local" ]]; then
+    if [[ "$WANT_OLLAMA" -eq 1 ]]; then
+    # ---- 6a. local: ensure Ollama native ---------------------------------------
+    step "Setting up Ollama (native)"
+    if command -v ollama >/dev/null 2>&1; then
+        ok "ollama CLI installed ($(ollama --version 2>/dev/null | head -n1))"
+    else
+        ensure_brew
+        if confirm "Install Ollama via 'brew install ollama' now?"; then
+            brew install ollama
+            ok "Installed Ollama"
+        else
+            fail "Install Ollama (https://ollama.com/download) and re-run."
+        fi
+    fi
+
+    if curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
+        ok "Ollama server reachable at http://localhost:11434"
+    else
+        info "Starting Ollama…"
+        if command -v brew >/dev/null 2>&1 && brew services list 2>/dev/null | grep -q '^ollama'; then
+            brew services start ollama >/dev/null 2>&1 || true
+        fi
+        for _ in 1 2 3 4 5; do
+            curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 && break
+            sleep 1
+        done
+        if ! curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; then
+            info "Starting 'ollama serve' in the background (logs → .ollama.log)…"
+            nohup ollama serve >.ollama.log 2>&1 &
+            disown || true
+            for _ in 1 2 3 4 5 6 7 8; do
+                curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 && break
+                sleep 1
+            done
+        fi
+        curl -sf http://localhost:11434/api/tags >/dev/null 2>&1 \
+            && ok "Ollama server is up" \
+            || fail "Ollama server didn't start. Run 'ollama serve' manually and re-run."
+    fi
+
+    else
+        info "Skipping Ollama setup (engine: $(c_cyan "$DEFAULT_ENGINE"))."
+    fi
+
+    # ---- 6b. local: point .env at SQLite (and native Ollama if wanted) ---------
+    step "Configuring .env for local mode"
+    set_env_var DATABASE_URL "sqlite:///./redink.db"
+    ok "DATABASE_URL → SQLite at $(c_cyan "./redink.db")"
+    if [[ "$WANT_OLLAMA" -eq 1 ]]; then
+        set_env_var OLLAMA_HOST "http://localhost:11434"
+        ok "OLLAMA_HOST  → $(c_cyan 'http://localhost:11434')"
+    fi
+else
+    # ---- 6c. docker path: Docker required --------------------------------------
+    step "Checking Docker"
+    if ! command -v docker >/dev/null 2>&1; then
+        ensure_brew
+        if confirm "Docker not installed. Install Docker Desktop via 'brew install --cask docker' now?"; then
+            brew install --cask docker
+            info "Docker installed. Launch Docker Desktop, wait for the whale icon, then re-run ./install-redink."
+            exit 0
+        fi
+        fail "Docker required for this profile."
+    fi
+    if ! docker info >/dev/null 2>&1; then
+        info "Docker daemon not running; starting Docker Desktop…"
+        open -a Docker 2>/dev/null || true
+        for _ in $(seq 1 30); do
+            docker info >/dev/null 2>&1 && break
+            sleep 2
+        done
+        docker info >/dev/null 2>&1 || fail "Docker didn't start. Launch Docker Desktop manually and re-run."
+    fi
+    ok "Docker daemon up"
+
+    set_env_var DATABASE_URL "postgresql+psycopg://redink:redink@postgres:5432/redink"
+    if [[ "$WANT_OLLAMA" -eq 1 ]]; then
+        set_env_var OLLAMA_HOST "http://ollama:11434"
+    fi
+    ok "Configured .env for docker-compose networking"
+fi
+
+# Record the default engine so CLI + Slack honour the user's choice.
+set_env_var REDINK_ENGINE "$DEFAULT_ENGINE"
+ok "REDINK_ENGINE → $(c_cyan "$DEFAULT_ENGINE")"
+
+# --- 7. GITHUB_PAT with inline guide --------------------------------------------
+
+step "GitHub credentials"
+
+current_pat=$(grep -E '^GITHUB_PAT=' .env | tail -n1 | cut -d= -f2- | tr -d ' "' || true)
+current_app_id=$(grep -E '^GITHUB_APP_ID=' .env | tail -n1 | cut -d= -f2- | tr -d ' "' || true)
+
+if [[ -z "$current_pat" && -z "$current_app_id" && -z "${GITHUB_PAT:-}" ]]; then
+    cat <<EOF
+
+    $(c_bold 'How to generate a GitHub PAT for Redink')
+    $(c_dim '─────────────────────────────────────────')
+    1. Open $(c_cyan 'https://github.com/settings/tokens?type=beta')
+    2. Click $(c_bold '"Generate new token"')
+    3. $(c_bold 'Token name'):        redink-poc
+    4. $(c_bold 'Expiration'):        30 days (or whatever suits you)
+    5. $(c_bold 'Repository access'): "Only select repositories" → pick the repo(s)
+                            you want to review (e.g. hotstar/mono-argus)
+    6. $(c_bold 'Permissions'):       scroll to $(c_cyan 'Repository permissions') →
+                            $(c_bold 'Pull requests')  →  $(c_bold 'Access: Read and write')
+                            $(c_dim '(Do NOT add other permissions — PR R/W is all we need.)')
+    7. Click $(c_bold 'Generate token'), copy the $(c_cyan 'github_pat_…') string.
+
+EOF
+    if command -v open >/dev/null 2>&1; then
+        if confirm "Open the GitHub token page in your browser now?"; then
+            open "https://github.com/settings/tokens?type=beta" || true
+        fi
+    fi
+    read -r -p "    Paste your GITHUB_PAT (or press Enter to edit .env manually later): " entered_pat
+    if [[ -n "$entered_pat" ]]; then
+        set_env_var GITHUB_PAT "$entered_pat"
+        ok "Wrote GITHUB_PAT to .env"
+    else
+        warn "Skipped — open .env and set GITHUB_PAT before running a review."
+    fi
+elif [[ -n "${GITHUB_PAT:-}" && -z "$current_pat" ]]; then
+    set_env_var GITHUB_PAT "$GITHUB_PAT"
+    ok "Picked up GITHUB_PAT from environment"
+elif [[ -n "$current_pat" ]]; then
+    ok "GITHUB_PAT already set in .env"
+elif [[ -n "$current_app_id" ]]; then
+    ok "GitHub App creds already set in .env"
+fi
+
+# --- 8. Start the api -----------------------------------------------------------
+
+if [[ "$PROFILE" == "local" ]]; then
+    step "Starting redink-api (venv, background)"
+    redink up
+else
+    step "Bringing up compose stack"
+    docker compose up -d postgres ollama api
+    printf '    Waiting for API'
+    for i in $(seq 1 30); do
+        if curl -sf http://localhost:8080/healthz >/dev/null 2>&1; then
+            printf '\n'
+            ok "API reachable at http://localhost:8080"
+            break
+        fi
+        printf '.'; sleep 1
+        [[ "$i" -eq 30 ]] && { printf '\n'; warn "API didn't report healthy within 30s."; }
+    done
+fi
+
+# --- 9. Ollama model ------------------------------------------------------------
+
+if [[ "$WANT_OLLAMA" -eq 0 ]]; then
+    step "Skipping Ollama model pull"
+    info "Engine is $(c_cyan "$DEFAULT_ENGINE"); no local model needed."
+else
+
+step "Checking Ollama model"
+
+model=$(grep -E '^OLLAMA_MODEL=' .env | tail -n1 | cut -d= -f2- | tr -d ' "' || echo "")
+model=${model:-gemma4:e2b}
+
+pull_model_local() {
+    if ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$model"; then
+        ok "Model $(c_cyan "$model") already pulled"
+    else
+        warn "Pulling $(c_cyan "$model") — this can take a few minutes…"
+        if ! ollama pull "$model"; then
+            warn "Pull failed. If the model name is wrong, edit OLLAMA_MODEL in .env and re-run."
+            warn "Good small-model choices: gemma3:4b, llama3.2:3b, qwen2.5:3b."
+        else
+            ok "Pulled $model"
+        fi
+    fi
+}
+
+pull_model_docker() {
+    if docker compose exec -T ollama ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$model"; then
+        ok "Model $(c_cyan "$model") already pulled (in container)"
+    else
+        warn "Pulling $(c_cyan "$model") in the ollama container…"
+        if ! docker compose exec -T ollama ollama pull "$model"; then
+            warn "Pull failed. If the model name is wrong, edit OLLAMA_MODEL in .env and re-run."
+            warn "Good small-model choices: gemma3:4b, llama3.2:3b, qwen2.5:3b."
+        else
+            ok "Pulled $model"
+        fi
+    fi
+}
+
+[[ "$PROFILE" == "local" ]] && pull_model_local || pull_model_docker
+
+fi  # end WANT_OLLAMA
+
+# --- 10. doctor -----------------------------------------------------------------
+
+step "Running redink doctor"
+redink doctor || warn "doctor flagged some checks — see above."
+
+# --- 11. Cheat sheet ------------------------------------------------------------
+
+printf '\n%s %s %s\n\n' "$(c_cyan '==>')" "$(wordmark)" "$(c_bold 'is ready. Run a review:')"
+cat <<EOF
+    $(c_dim "Default engine: $DEFAULT_ENGINE  (override per-review with -e / --engine)")
+
+    redink review https://github.com/<org>/<repo>/pull/<n> --watch
+
+    # Everyday commands
+    redink guide                 # full cheat sheet
+    redink status <id>           # check a session
+    redink answer <id> --text "..."   # reply to a clarification question
+    redink doctor                # re-verify components
+
+    # Start / stop the api
+    redink up                    # start (venv-api in local mode, compose in docker mode)
+    redink down                  # stop
+EOF
+
+if [[ "$PROFILE" == "local" ]]; then
+    cat <<EOF
+
+    $(c_dim 'Local-mode notes:')
+    $(c_dim '  api logs: .redink-api.log     |  pid file: .redink-api.pid')
+    $(c_dim '  SQLite db: ./redink.db        |  Ollama logs: .ollama.log (if started by bootstrap)')
+EOF
+fi
+
+# --- 12. Leave the user in an activated shell ----------------------------------
+#
+# If the script was executed (`./install-redink`), a plain `source .venv/bin/activate`
+# above doesn't persist into the parent shell. Drop them into a fresh interactive
+# shell that inherits the already-exported VIRTUAL_ENV + PATH. Type `exit` to leave.
+#
+# If the user sourced the installer (`source ./install-redink`), the venv is already
+# active in their shell — don't exec, that would replace/kill their shell.
+
+if ! (return 0 2>/dev/null); then
+    printf '\n    %s\n\n' "$(c_dim "Dropping you into a new shell with .venv active — type 'exit' when done.")"
+    exec "$SHELL" -i
+fi

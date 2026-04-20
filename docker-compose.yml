@@ -1,0 +1,85 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-redink}
+      POSTGRES_USER: ${POSTGRES_USER:-redink}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-redink}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-redink}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    command: redink-api
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./secrets:/secrets:ro
+
+  worker:
+    build: .
+    command: redink-worker
+    env_file: .env
+    depends_on:
+      - api
+    volumes:
+      - ./secrets:/secrets:ro
+
+  slack:
+    build: .
+    command: redink-slack
+    env_file: .env
+    depends_on:
+      - api
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./secrets:/secrets:ro
+
+  sweeper:
+    build: .
+    command: redink-sweeper
+    env_file: .env
+    depends_on:
+      - api
+    volumes:
+      - ./secrets:/secrets:ro
+
+volumes:
+  pgdata:
+  ollama:
