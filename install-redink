@@ -379,10 +379,19 @@ elif [[ -n "$current_app_id" ]]; then
     ok "GitHub App creds already set in .env"
 fi
 
-# --- 8. Start the api -----------------------------------------------------------
+# --- 8. Start (or restart) the api ---------------------------------------------
+#
+# IMPORTANT: settings() is @lru_cache'd — the API reads .env exactly once at
+# startup. If the API is already running with old env vars (e.g. from a
+# previous install that chose Ollama and we just switched to claude-code) it
+# must be restarted so it picks up the new REDINK_ENGINE / REDINK_MODEL.
+# We always stop then start in local mode to guarantee a fresh env load.
 
 if [[ "$PROFILE" == "local" ]]; then
-    step "Starting redink-api (venv, background)"
+    step "Restarting redink-api to pick up new .env settings"
+    # Stop any running instance — redink down is a no-op if nothing is running.
+    redink down 2>/dev/null || true
+    sleep 1
     redink up
 else
     step "Bringing up compose stack"

@@ -181,7 +181,11 @@ def up() -> None:
         try:
             pid = int(pid_file.read_text().strip())
             os.kill(pid, 0)  # signal 0 = probe
-            rprint(f"[yellow]redink-api already running (pid {pid})[/yellow]")
+            rprint(
+                f"[yellow]redink-api already running (pid {pid}).[/yellow]\n"
+                f"  [dim]Settings are loaded once at startup — if you changed .env "
+                f"(engine, model, tokens) run [bold]redink down && redink up[/bold] to restart.[/dim]"
+            )
             return
         except (OSError, ValueError):
             pid_file.unlink(missing_ok=True)
